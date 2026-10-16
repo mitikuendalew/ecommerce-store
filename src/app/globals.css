@@ -1,0 +1,7 @@
+/* Tailwind v4. On Tailwind v3 replace this line with the three @tailwind directives. */
+@import "tailwindcss";
+
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
