@@ -4,26 +4,26 @@ import { notFound } from "next/navigation";
 import ImageGallery from "@/components/ImageGallery";
 import PurchasePanel from "@/components/PurchasePanel";
 import StockStatus from "@/components/StockStatus";
-import { ApiError, api } from "@/lib/client";
+import { AppError } from "@/lib/errors";
 import { money } from "@/lib/format";
 import { container, focusRing } from "@/lib/styles";
-import type { Product } from "@/lib/types";
+import { getProduct } from "@/services/product.service";
 
 export const dynamic = "force-dynamic";
 type Params = Promise<{ slug: string }>;
 
 async function load(slug: string) {
   try {
-    return await api<Product>(`/api/products/${encodeURIComponent(slug)}`);
+    return await getProduct(slug);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) notFound();
+    if (e instanceof AppError && e.status === 404) notFound();
     throw e;
   }
 }
 
 export async function generateMetadata({ params }: { params: Params }): Promise<Metadata> {
   const { slug } = await params;
-  const p = await api<Product>(`/api/products/${encodeURIComponent(slug)}`).catch(() => null);
+  const p = await getProduct(slug).catch(() => null);
   return p ? { title: p.name, description: p.description.slice(0, 155) } : { title: "Product" };
 }
 

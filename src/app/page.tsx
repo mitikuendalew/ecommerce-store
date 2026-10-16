@@ -1,10 +1,9 @@
 import Link from "next/link";
 import ProductCard from "@/components/ProductCard";
-import { api } from "@/lib/client";
+import { listCategories, listProducts } from "@/services/product.service";
 import { btnGhostOnDark, btnOnDark, container, focusRing } from "@/lib/styles";
-import type { Category, Paginated, Product } from "@/lib/types";
 
-export const dynamic = "force-dynamic"; // fetches the API on each request; switch to ISR once the API is deployed separately
+export const dynamic = "force-dynamic"; // reads the catalog on each request
 
 const tileColors = [
   "from-indigo-500 to-violet-600",
@@ -18,16 +17,17 @@ const tileColors = [
 async function safe<T>(p: Promise<T>, fallback: T) {
   try {
     return await p;
-  } catch {
-    return fallback; // the page should still render if the API is down
+  } catch (err) {
+    console.error("[home]", err);
+    return fallback; // the page should still render if the database is unreachable
   }
 }
 
 export default async function HomePage() {
   const [categories, trending] = await Promise.all([
-    safe(api<Category[]>("/api/categories"), []),
+    safe(listCategories(), []),
     // "Trending" = newest for now; swap the sort once you track sales or views.
-    safe(api<Paginated<Product>>("/api/products?sort=newest&pageSize=8"), null),
+    safe(listProducts({ sort: "newest", page: 1, pageSize: 8 }), null),
   ]);
   const products = trending?.items ?? [];
 

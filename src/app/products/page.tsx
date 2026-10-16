@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import ProductCard from "@/components/ProductCard";
-import { api } from "@/lib/client";
+import { productQuerySchema } from "@/lib/validators";
+import { listCategories, listProducts } from "@/services/product.service";
 import { btnPrimary, container, focusRing, inputCls } from "@/lib/styles";
-import type { Category, Paginated, Product } from "@/lib/types";
+import type { Category } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Shop" };
@@ -23,8 +24,10 @@ export default async function ProductsPage({ searchParams }: { searchParams: SP 
   if (category) params.set("category", category);
 
   const [result, categories] = await Promise.all([
-    api<Paginated<Product>>(`/api/products?${params}`).catch(() => null),
-    api<Category[]>("/api/categories").catch(() => [] as Category[]),
+    Promise.resolve()
+      .then(() => listProducts(productQuerySchema.parse(Object.fromEntries(params))))
+      .catch((err) => (console.error("[products]", err), null)),
+    listCategories().catch(() => [] as Category[]),
   ]);
 
   const pageHref = (p: number) => {

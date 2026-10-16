@@ -1,32 +1,62 @@
-import type { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { db, type Tx } from "../../db";
+import { cartItems, carts, productImages, products } from "../../db/schema";
 import { AppError, notFound } from "@/lib/errors";
 import { config } from "@/lib/config";
 
-const cartInclude = {
-  items: {
-    orderBy: { createdAt: "asc" },
-    include: {
-      product: {
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          priceCents: true,
-          stock: true,
-          isActive: true,
-          images: { orderBy: { position: "asc" }, take: 1, select: { url: true, alt: true } },
-        },
-      },
-    },
-  },
-} satisfies Prisma.CartInclude;
+/** Returns the user's cart id, creating the cart on first use. */
+async function ensureCart(userId: string, tx: Tx | typeof db = db) {
+  const [cart] = await tx
+    .insert(carts)
+    .values({ userId })
+    .onConflictDoUpdate({ target: carts.userId, set: { userId: sql`excluded.user_id` } })
+    .returning({ id: carts.id });
+  return cart.id;
+}
 
-type CartWithItems = Prisma.CartGetPayload<{ include: typeof cartInclude }>;
+/** Ids of the items in this user's cart that match `itemId` (scoping by user means nobody can touch another cart). */
+const ownedItem = (userId: string, itemId: string) =>
+  and(
+    eq(cartItems.id, itemId),
+    inArray(cartItems.cartId, db.select({ id: carts.id }).from(carts).where(eq(carts.userId, userId))),
+  );
 
 /** Shape the cart for the client. Prices come from the DB, so the client can never set them. */
-function format(cart: CartWithItems) {
-  const items = cart.items.map((i) => ({
+export async function getCart(userId: string) {
+  const cartId = await ensureCart(userId);
+
+  const rows = await db
+    .select({
+      id: cartItems.id,
+      quantity: cartItems.quantity,
+      product: {
+        id: products.id,
+        name: products.name,
+        slug: products.slug,
+        priceCents: products.priceCents,
+        stock: products.stock,
+        isActive: products.isActive,
+      },
+    })
+    .from(cartItems)
+    .innerJoin(products, eq(cartItems.productId, products.id))
+    .where(eq(cartItems.cartId, cartId))
+    .orderBy(asc(cartItems.createdAt), asc(cartItems.id));
+
+  const images = rows.length
+    ? await db
+        .selectDistinctOn([productImages.productId], {
+          productId: productImages.productId,
+          url: productImages.url,
+          alt: productImages.alt,
+        })
+        .from(productImages)
+        .where(inArray(productImages.productId, rows.map((r) => r.product.id)))
+        .orderBy(productImages.productId, asc(productImages.position))
+    : [];
+  const imageByProduct = new Map(images.map(({ productId, ...img }) => [productId, img]));
+
+  const items = rows.map((i) => ({
     id: i.id,
     quantity: i.quantity,
     unitPriceCents: i.product.priceCents,
@@ -38,11 +68,11 @@ function format(cart: CartWithItems) {
       name: i.product.name,
       slug: i.product.slug,
       stock: i.product.stock,
-      image: i.product.images[0] ?? null,
+      image: imageByProduct.get(i.product.id) ?? null,
     },
   }));
   return {
-    id: cart.id,
+    id: cartId,
     items,
     itemCount: items.reduce((n, i) => n + i.quantity, 0),
     subtotalCents: items.reduce((sum, i) => sum + i.lineTotalCents, 0),
@@ -50,27 +80,19 @@ function format(cart: CartWithItems) {
   };
 }
 
-export async function getCart(userId: string) {
-  const cart = await prisma.cart.upsert({
-    where: { userId },
-    create: { userId },
-    update: {},
-    include: cartInclude,
-  });
-  return format(cart);
-}
-
 export async function addItem(userId: string, productId: string, quantity: number) {
-  await prisma.$transaction(async (tx) => {
-    const product = await tx.product.findUnique({
-      where: { id: productId },
-      select: { isActive: true, stock: true, name: true },
-    });
+  await db.transaction(async (tx) => {
+    const [product] = await tx
+      .select({ isActive: products.isActive, stock: products.stock, name: products.name })
+      .from(products)
+      .where(eq(products.id, productId));
     if (!product || !product.isActive) throw notFound("Product");
 
-    const cart = await tx.cart.upsert({ where: { userId }, create: { userId }, update: {} });
-    const key = { cartId_productId: { cartId: cart.id, productId } };
-    const existing = await tx.cartItem.findUnique({ where: key });
+    const cartId = await ensureCart(userId, tx);
+    const [existing] = await tx
+      .select({ quantity: cartItems.quantity })
+      .from(cartItems)
+      .where(and(eq(cartItems.cartId, cartId), eq(cartItems.productId, productId)));
 
     const newQty = (existing?.quantity ?? 0) + quantity;
     if (newQty > config.maxQtyPerItem) {
@@ -82,39 +104,40 @@ export async function addItem(userId: string, productId: string, quantity: numbe
       });
     }
 
-    await tx.cartItem.upsert({
-      where: key,
-      create: { cartId: cart.id, productId, quantity: newQty },
-      update: { quantity: newQty },
-    });
+    await tx
+      .insert(cartItems)
+      .values({ cartId, productId, quantity: newQty })
+      .onConflictDoUpdate({ target: [cartItems.cartId, cartItems.productId], set: { quantity: newQty, updatedAt: new Date() } });
   });
   return getCart(userId);
 }
 
 export async function updateItemQuantity(userId: string, itemId: string, quantity: number) {
-  // Scoping by cart.userId means a user can never touch someone else's cart item.
-  const item = await prisma.cartItem.findFirst({
-    where: { id: itemId, cart: { userId } },
-    include: { product: { select: { stock: true, isActive: true, name: true } } },
-  });
+  const [item] = await db
+    .select({ stock: products.stock, isActive: products.isActive, name: products.name })
+    .from(cartItems)
+    .innerJoin(products, eq(cartItems.productId, products.id))
+    .where(ownedItem(userId, itemId));
   if (!item) throw notFound("Cart item");
-  if (!item.product.isActive) throw new AppError(409, "PRODUCT_UNAVAILABLE", `"${item.product.name}" is no longer available`);
-  if (quantity > item.product.stock) {
-    throw new AppError(409, "INSUFFICIENT_STOCK", `Only ${item.product.stock} of "${item.product.name}" left in stock`, {
-      available: item.product.stock,
+  if (!item.isActive) throw new AppError(409, "PRODUCT_UNAVAILABLE", `"${item.name}" is no longer available`);
+  if (quantity > item.stock) {
+    throw new AppError(409, "INSUFFICIENT_STOCK", `Only ${item.stock} of "${item.name}" left in stock`, {
+      available: item.stock,
     });
   }
-  await prisma.cartItem.update({ where: { id: itemId }, data: { quantity } });
+  await db.update(cartItems).set({ quantity }).where(eq(cartItems.id, itemId));
   return getCart(userId);
 }
 
 export async function removeItem(userId: string, itemId: string) {
-  const { count } = await prisma.cartItem.deleteMany({ where: { id: itemId, cart: { userId } } });
-  if (count === 0) throw notFound("Cart item");
+  const deleted = await db.delete(cartItems).where(ownedItem(userId, itemId)).returning({ id: cartItems.id });
+  if (deleted.length === 0) throw notFound("Cart item");
   return getCart(userId);
 }
 
 export async function clearCart(userId: string) {
-  await prisma.cartItem.deleteMany({ where: { cart: { userId } } });
+  await db
+    .delete(cartItems)
+    .where(inArray(cartItems.cartId, db.select({ id: carts.id }).from(carts).where(eq(carts.userId, userId))));
   return getCart(userId);
 }
