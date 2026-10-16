@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
-import { Prisma } from "@prisma/client";
 import { AppError } from "./errors";
 
 /** Next 15+ passes route params as a Promise. */
@@ -23,6 +22,14 @@ function errorBody(status: number, code: string, message: string, details?: unkn
   return NextResponse.json({ error: { code, message, details } }, { status });
 }
 
+/** Postgres SQLSTATE code, whether thrown directly by the driver or wrapped by Drizzle (`err.cause`). */
+function pgErrorCode(err: unknown): string | undefined {
+  for (let e = err as { code?: unknown; cause?: unknown } | undefined, i = 0; e && i < 3; e = e.cause as typeof e, i++) {
+    if (typeof e.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) return e.code;
+  }
+  return undefined;
+}
+
 export function toErrorResponse(err: unknown) {
   if (err instanceof ZodError) {
     return errorBody(
@@ -37,17 +44,13 @@ export function toErrorResponse(err: unknown) {
     return errorBody(err.status, err.code, err.message, err.details);
   }
 
-  if (err instanceof Prisma.PrismaClientKnownRequestError) {
-    switch (err.code) {
-      case "P2002": // unique constraint
-        return errorBody(409, "CONFLICT", "A record with this value already exists", {
-          fields: err.meta?.target,
-        });
-      case "P2025": // record not found
-        return errorBody(404, "NOT_FOUND", "Record not found");
-      case "P2003": // foreign key
-        return errorBody(400, "INVALID_REFERENCE", "A referenced record does not exist");
-    }
+  switch (pgErrorCode(err)) {
+    case "23505": // unique constraint
+      return errorBody(409, "CONFLICT", "A record with this value already exists");
+    case "23503": // foreign key
+      return errorBody(400, "INVALID_REFERENCE", "A referenced record does not exist");
+    case "23514": // check constraint (e.g. stock would go negative)
+      return errorBody(409, "CONFLICT", "That change isn't allowed");
   }
 
   // Unknown: log full detail server-side, return nothing sensitive.

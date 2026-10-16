@@ -15,7 +15,7 @@ export class ApiError extends Error {
 // Server-side fetches need an absolute URL; the browser uses same-origin relative URLs.
 const BASE =
   typeof window === "undefined"
-    ? (process.env.API_URL ?? "http://localhost:3000")
+    ? (process.env.API_URL ?? process.env.URL ?? "http://localhost:3000")
     : (process.env.NEXT_PUBLIC_API_URL ?? "");
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
